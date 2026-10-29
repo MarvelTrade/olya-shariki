@@ -347,6 +347,8 @@ export function createGame(cfg, rng = Math.random, opts = {}) {
   const api = {
     /** Живое состояние (только читать!). */
     state: S,
+    /** 'play' | 'won' | 'lost' */
+    get status() { return S.status; },
     /** Обменять соседние клетки a=[x,y] и b=[x,y]. Выполняет весь ход: каскад, бонус, автоперемешивание. */
     swap(a, b) {
       begin();

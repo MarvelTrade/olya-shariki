@@ -1,0 +1,99 @@
+/* Layout: one-screen game. Map screen = tall winding family path (level 1 at bottom), game screen = HUD on top, board in the middle, family boosters at the bottom. Single bright look by design. */
+:root{
+  --ink:#43264a;
+  --ink-soft:#8a6a90;
+  --paper:#fff6fa;
+  --card:#ffffff;
+  --pink:#ff5c8a;
+  --pink-deep:#d93a6c;
+  --sun:#ffc93c;
+  --mint:#2ec4b6;
+  --lock:#d8cfe0;
+  --font-display:'Pacifico','Comic Sans MS',cursive;
+  --font-ui:'Nunito','Trebuchet MS',system-ui,sans-serif;
+  color-scheme:light;
+}
+html{height:100%;box-sizing:border-box}
+*,*::before,*::after{box-sizing:border-box}
+/* атрибут hidden должен побеждать display у .screen и #modal (в старой версии модалка-оверлей не скрывалась) */
+[hidden]{display:none!important}
+body{height:100%;margin:0;background:var(--paper);color:var(--ink);font-family:var(--font-ui);font-weight:800;overflow:hidden;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+button{font-family:inherit;color:inherit;cursor:pointer}
+button:focus-visible{outline:3px solid var(--pink);outline-offset:3px}
+.screen{position:relative;height:100%;display:flex;flex-direction:column}
+.pad{padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+
+/* ---------- map ---------- */
+.mapbar{display:flex;align-items:center;gap:10px;padding-block:8px;background:linear-gradient(180deg,#fff,#fff0f6);box-shadow:0 2px 0 rgba(67,38,74,.06);z-index:2}
+.logo{font-family:var(--font-display);font-size:26px;line-height:1.1;color:var(--pink-deep);font-weight:400;margin:0;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pill{display:inline-flex;align-items:center;gap:5px;background:var(--card);border-radius:999px;padding:5px 12px;font-size:15px;box-shadow:0 2px 0 rgba(67,38,74,.12);font-variant-numeric:tabular-nums;border:0}
+.pill svg{width:18px;height:18px}
+#mapScroll{flex:1;overflow-y:auto;overflow-x:hidden;position:relative;-webkit-overflow-scrolling:touch}
+#mapInner{position:relative;width:100%;max-width:520px;margin:0 auto}
+.world-bg{position:absolute;left:-50vw;right:-50vw}
+#mapSvg{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.node{position:absolute;width:56px;height:56px;margin:-28px 0 0 -28px;border-radius:50%;border:4px solid #fff;font:900 20px/1 var(--font-ui);color:#fff;box-shadow:0 5px 0 rgba(67,38,74,.18);display:grid;place-items:center;padding:0;font-variant-numeric:tabular-nums}
+.node.locked{background:var(--lock)!important;color:#fff;box-shadow:0 4px 0 rgba(67,38,74,.1);cursor:default}
+.node.cur{width:66px;height:66px;margin:-33px 0 0 -33px;font-size:24px;animation:bob 1.4s ease-in-out infinite}
+.node .st{position:absolute;bottom:-17px;left:50%;transform:translateX(-50%);display:flex;gap:0}
+.node .st svg{width:17px;height:17px}
+.node.big{border-color:var(--sun)}
+@keyframes bob{50%{transform:translateY(-6px)}}
+.banner{position:absolute;left:50%;transform:translateX(-50%);background:var(--card);border-radius:18px;padding:8px 16px;text-align:center;box-shadow:0 4px 0 rgba(67,38,74,.12);width:min(300px,80%)}
+.banner b{display:block;font-family:var(--font-display);font-weight:400;font-size:19px;color:var(--pink-deep);line-height:1.3}
+.banner span{display:block;font-size:12.5px;color:var(--ink-soft);font-weight:700;line-height:1.3}
+.pet{position:absolute;pointer-events:none}
+
+/* ---------- game ---------- */
+#game{background:linear-gradient(180deg,#fff4d6,#ffd9e8)}
+.hud{display:grid;grid-template-columns:auto auto 1fr;gap:10px;align-items:center;padding-block:8px 4px}
+.iconbtn{width:44px;height:44px;border-radius:14px;border:0;background:var(--card);box-shadow:0 3px 0 rgba(67,38,74,.15);font-size:24px;font-weight:900;display:grid;place-items:center}
+.moves{background:var(--card);border-radius:16px;padding:3px 12px;text-align:center;box-shadow:0 3px 0 rgba(67,38,74,.15);min-width:62px}
+.moves small{display:block;font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-soft)}
+.moves b{display:block;font-size:24px;line-height:1.05;font-variant-numeric:tabular-nums}
+.moves.low b{color:var(--pink-deep)}
+.scorebox{min-width:0}
+.scorebox .top{display:flex;justify-content:space-between;align-items:baseline;font-size:12px;color:var(--ink-soft);margin-bottom:3px}
+.scorebox .top b{font-size:18px;color:var(--ink);font-variant-numeric:tabular-nums}
+.bar{position:relative;height:14px;background:rgba(255,255,255,.75);border-radius:999px;box-shadow:inset 0 2px 0 rgba(67,38,74,.08)}
+.bar i{position:absolute;left:0;top:0;bottom:0;border-radius:999px;background:linear-gradient(90deg,var(--sun),var(--pink));width:0;transition:width .3s}
+.bar .mk{position:absolute;top:50%;width:22px;height:22px;margin:-11px 0 0 -11px}
+.goals{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;padding-block:4px}
+.goal{display:flex;align-items:center;gap:4px;background:rgba(255,255,255,.85);border-radius:14px;padding:3px 10px 3px 3px;font-size:17px;font-variant-numeric:tabular-nums;box-shadow:0 2px 0 rgba(67,38,74,.1)}
+.goal img{width:32px;height:32px}
+.goal.done{background:#d9f7e8}
+.goal.done b{color:#16a06a}
+#boardWrap{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;padding-block:6px}
+#board{touch-action:none;display:block}
+.boosters{display:flex;justify-content:center;gap:14px;padding-block:6px 12px}
+.booster{position:relative;width:76px;border:0;background:var(--card);border-radius:18px;padding:4px 2px 6px;box-shadow:0 4px 0 rgba(67,38,74,.15);display:flex;flex-direction:column;align-items:center;gap:0}
+.booster canvas{width:44px;height:44px}
+.booster span{font-size:11px;line-height:1.15;color:var(--ink-soft)}
+.booster em{position:absolute;top:-6px;right:-6px;min-width:22px;height:22px;border-radius:11px;background:var(--pink);color:#fff;font-style:normal;font-size:13px;display:grid;place-items:center;padding:0 5px;border:2px solid #fff}
+.booster.active{outline:4px solid var(--pink);outline-offset:2px}
+.booster:disabled{opacity:.45}
+.hintline{text-align:center;font-size:13px;color:var(--ink-soft);min-height:18px}
+
+/* ---------- modal ---------- */
+#modal{position:fixed;inset:0;background:rgba(67,38,74,.45);display:grid;place-items:center;z-index:20;padding:16px}
+.card{background:var(--card);border-radius:28px;padding:22px 20px 18px;width:min(360px,100%);text-align:center;box-shadow:0 10px 0 rgba(67,38,74,.2);animation:popin .35s cubic-bezier(.2,1.6,.4,1)}
+@keyframes popin{from{transform:scale(.7);opacity:0}}
+.card h2{font-family:var(--font-display);font-weight:400;font-size:30px;color:var(--pink-deep);margin:0 0 2px;line-height:1.25;text-wrap:balance}
+.card .sub{color:var(--ink-soft);font-size:14px;margin:0 0 12px;font-weight:700}
+.card .goals{margin:8px 0 12px}
+.card p.msg{font-size:16px;margin:8px 0 12px;line-height:1.35;text-wrap:balance}
+.bigstars{display:flex;justify-content:center;gap:6px;margin:6px 0}
+.bigstars svg{width:58px;height:58px}
+.bigstars svg:nth-child(2){transform:translateY(-10px)}
+.bigstars .on{animation:starpop .5s cubic-bezier(.2,1.8,.4,1) both}
+.bigstars .on:nth-child(2){animation-delay:.25s}
+.bigstars .on:nth-child(3){animation-delay:.5s}
+@keyframes starpop{from{transform:scale(0) rotate(-40deg)}}
+.btns{display:flex;flex-direction:column;gap:8px;margin-top:10px}
+.btn{border:0;border-radius:18px;padding:13px 16px;font-size:18px;font-weight:900;background:var(--pink);color:#fff;box-shadow:0 5px 0 var(--pink-deep)}
+.btn.alt{background:#f3eaf6;color:var(--ink);box-shadow:0 4px 0 #dccbe3}
+.btn.gold{background:var(--sun);color:var(--ink);box-shadow:0 5px 0 #d9a21c}
+.btn:active{transform:translateY(3px);box-shadow:none}
+.petrow{display:flex;justify-content:center;gap:4px}
+.small{font-size:13px;color:var(--ink-soft);font-weight:700}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
