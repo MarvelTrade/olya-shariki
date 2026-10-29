@@ -2,6 +2,8 @@
 // Каждое действие (ход, бустер) выполняется синхронно до конца и возвращает список шагов (steps),
 // который рендер проигрывает с анимациями. Порядок вызовов rng совпадает со старым index.html,
 // поэтому при одинаковом rng новая и старая версии ведут себя одинаково (см. tests/engine/legacy-diff.test.mjs).
+// Новые механики (шоколад, соски Маши, телепорты) включаются только если они есть в конфиге уровня
+// и не тратят rng на уровнях без них — поэтому сравнение со старой версией остаётся точным.
 import { TEXT, COMBO_TXT } from './texts.js';
 
 /** Число цветов в палитре (для подсчёта самого частого цвета у радуги). */
@@ -19,15 +21,30 @@ const DIRS4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
  * @param {object} [opts]
  * @param {boolean} [opts.events=true]  записывать шаги со снимками (для бота можно выключить — быстрее)
  * @param {Array<Array<number|object|null>>} [opts.board]  готовое поле вместо случайного заполнения
- *        (число — цвет; объект {c, sp, lock}; null — пусто). Заморозка из cfg.locks тогда не расставляется.
+ *        (число — цвет; объект {c, sp, lock, pac}; 'p' — соска; null — пусто). Заморозка из cfg.locks тогда не расставляется.
+ *
+ * Новые поля cfg (все необязательные):
+ *   choco[y][x] = 1 — шоколад (клетка без фишки, разрастается, если за ход ни одна плитка не съедена);
+ *   pacifiers = {total, max} — соски Маши: всего total, на поле одновременно не больше max; цель — довести до низа;
+ *   teleports = [[[fx,fy],[tx,ty]], ...] — фишка из клетки from «проваливается» в клетку to;
+ *   start = ['0123.', ...] — готовое стартовое поле (цифра — цвет, p — соска, . — случайный цвет).
  */
 export function createGame(cfg, rng = Math.random, opts = {}) {
   const record = opts.events !== false;
   const W = cfg.w, H = cfg.h, mask = cfg.mask;
+  const hasChoco = !!cfg.choco && cfg.choco.some(r => r.some(v => v));
+  const pacCfg = cfg.pacifiers && cfg.pacifiers.total > 0 ? cfg.pacifiers : null;
+  const portals = cfg.teleports && cfg.teleports.length ? cfg.teleports : null;
   const S = {
     n: cfg.n, cfg, w: W, h: H, mask,
     ice: cfg.ice.map(r => r.slice()),
     crate: cfg.crate.map(r => r.slice()),
+    /** Шоколад [y][x] (0/1) или null, если на уровне его нет. */
+    choco: hasChoco ? cfg.choco.map(r => r.map(v => (v ? 1 : 0))) : null,
+    /** Соски: сколько уже появилось / сейчас на поле / доведено. null — механики нет. */
+    pac: pacCfg ? { total: pacCfg.total, max: Math.max(1, pacCfg.max || 1), spawned: 0, onBoard: 0, done: 0 } : null,
+    /** Телепорты (статичны): [[[fx,fy],[tx,ty]], ...] */
+    teleports: portals || [],
     tiles: null,
     moves: cfg.moves,
     score: 0,
@@ -39,15 +56,26 @@ export function createGame(cfg, rng = Math.random, opts = {}) {
   let tileId = 0;
   let steps = [];
   let pending = freshPending();
+  /** Съедено ли за текущий ход хоть одна плитка шоколада (иначе он разрастается). */
+  let chocoEaten = false;
 
-  function freshPending() { return { fx: [], hits: [], sfx: [], pop: [], popups: [], spawn: [], slide: [], created: [], removed: [], banner: null }; }
+  // Телепорты: куда (ключ клетки to) → откуда [fx,fy]; множество входов.
+  const portalTo = new Map(), portalFrom = new Set();
+  if (portals) for (const [[fx, fy], [tx, ty]] of portals) { portalTo.set(ty * W + tx, [fx, fy]); portalFrom.add(fy * W + fx); }
+  // Выходы для сосок: нижняя клетка каждого столбца (если она не вход телепорта).
+  const exits = new Set();
+  if (pacCfg) for (let x = 0; x < W; x++) { for (let y = H - 1; y >= 0; y--) if (mask[y][x]) { if (!portalFrom.has(y * W + x)) exits.add(y * W + x); break; } }
+
+  function freshPending() { return { fx: [], hits: [], sfx: [], pop: [], popups: [], spawn: [], slide: [], created: [], removed: [], teleport: [], banner: null }; }
 
   /* ---------- запись шагов ---------- */
   function snapshot() {
     return {
-      tiles: S.tiles.map(row => row.map(t => (t ? { id: t.id, c: t.c, sp: t.sp, lock: t.lock } : null))),
+      tiles: S.tiles.map(row => row.map(t => (t ? (t.pac ? { id: t.id, c: t.c, sp: t.sp, lock: t.lock, pac: true } : { id: t.id, c: t.c, sp: t.sp, lock: t.lock }) : null))),
       ice: S.ice.map(r => r.slice()),
       crate: S.crate.map(r => r.slice()),
+      ...(S.choco ? { choco: S.choco.map(r => r.slice()) } : {}),
+      ...(S.pac ? { pac: { ...S.pac } } : {}),
       score: S.score,
       moves: S.moves,
       goals: S.goals.map(g => ({ ...g })),
@@ -71,10 +99,14 @@ export function createGame(cfg, rng = Math.random, opts = {}) {
 
   /* ---------- поле ---------- */
   const newTile = c => ({ id: tileId++, c, sp: null, lock: 0, protect: false });
+  /** Соска Маши: не матчится, не взрывается, падает; собирается в нижней клетке столбца. c = -1. */
+  const newPac = () => ({ id: tileId++, c: -1, sp: null, lock: 0, protect: false, pac: true });
   const inb = (x, y) => x >= 0 && y >= 0 && x < W && y < H;
-  const movable = (x, y) => inb(x, y) && mask[y][x] && !S.crate[y][x] && S.tiles[y][x] && !S.tiles[y][x].lock;
+  /** Клетка занята блоком (ящик или шоколад) — фишки в ней нет. */
+  const blk = hasChoco ? (x, y) => S.crate[y][x] || S.choco[y][x] : (x, y) => S.crate[y][x];
+  const movable = (x, y) => inb(x, y) && mask[y][x] && !blk(x, y) && S.tiles[y][x] && !S.tiles[y][x].lock;
   function colorAt(x, y) {
-    if (!inb(x, y) || !mask[y][x] || S.crate[y][x]) return -1;
+    if (!inb(x, y) || !mask[y][x] || blk(x, y)) return -1;
     const t = S.tiles[y][x];
     if (!t || t.sp === 'c') return -1;
     return t.c;
@@ -85,12 +117,30 @@ export function createGame(cfg, rng = Math.random, opts = {}) {
     for (let attempt = 0; attempt < 60; attempt++) {
       S.tiles = grid(W, H, null);
       for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
-        if (!mask[y][x] || S.crate[y][x]) continue;
+        if (!mask[y][x] || blk(x, y)) continue;
         let c, guard = 0;
         do { c = randColor(); } while (guard++ < 30 && ((colorAt(x - 1, y) === c && colorAt(x - 2, y) === c) || (colorAt(x, y - 1) === c && colorAt(x, y - 2) === c)));
         S.tiles[y][x] = newTile(c);
       }
       if (findMove()) break;
+    }
+  }
+  /** Готовое стартовое поле из cfg.start (обучающие уровни): цифра — цвет, p — соска, . — оставить случайный. */
+  function applyStart() {
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const ch = cfg.start[y]?.[x];
+      if (!ch || ch === '.' || !mask[y][x] || blk(x, y)) continue;
+      if (ch === 'p') { if (S.pac && S.pac.spawned < S.pac.total) { S.tiles[y][x] = newPac(); S.pac.spawned++; S.pac.onBoard++; } }
+      else if (ch >= '0' && ch <= '9') S.tiles[y][x] = newTile(Number(ch) % cfg.colors);
+    }
+  }
+  /** Стартовые соски: в верхние клетки случайных столбцов (только на уровнях с сосками). */
+  function placePacifiers() {
+    const tops = [];
+    for (let x = 0; x < W; x++) for (let y = 0; y < H; y++) if (mask[y][x]) { if (!blk(x, y) && S.tiles[y][x] && !exits.has(y * W + x)) tops.push([x, y]); break; }
+    while (S.pac.onBoard < S.pac.max && S.pac.spawned < S.pac.total && tops.length) {
+      const [x, y] = tops.splice(Math.floor(rng() * tops.length), 1)[0];
+      S.tiles[y][x] = newPac(); S.pac.spawned++; S.pac.onBoard++;
     }
   }
   function placeLocks() {
@@ -107,7 +157,8 @@ export function createGame(cfg, rng = Math.random, opts = {}) {
     S.tiles = grid(W, H, null);
     for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
       const v = board[y][x];
-      if (v == null || !mask[y][x] || S.crate[y][x]) continue;
+      if (v == null || !mask[y][x] || blk(x, y)) continue;
+      if (v === 'p' || v.pac) { S.tiles[y][x] = newPac(); if (S.pac) { S.pac.spawned++; S.pac.onBoard++; } continue; }
       const t = newTile(typeof v === 'number' ? v : v.c);
       if (typeof v === 'object') { t.sp = v.sp || null; t.lock = v.lock || 0; }
       S.tiles[y][x] = t;
@@ -140,7 +191,7 @@ export function createGame(cfg, rng = Math.random, opts = {}) {
     for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) for (const [dx, dy] of [[1, 0], [0, 1]]) {
       const nx = x + dx, ny = y + dy; if (!movable(x, y) || !movable(nx, ny)) continue;
       const a = S.tiles[y][x], b = S.tiles[ny][nx];
-      let ok = a.sp === 'c' || b.sp === 'c' || (a.sp && b.sp);
+      let ok = !a.pac && !b.pac && (a.sp === 'c' || b.sp === 'c' || (a.sp && b.sp));
       if (!ok) { S.tiles[y][x] = b; S.tiles[ny][nx] = a; ok = lineAt(x, y) || lineAt(nx, ny); S.tiles[y][x] = a; S.tiles[ny][nx] = b; }
       if (ok) { out.push([[x, y], [nx, ny]]); if (out.length >= limit) return out; }
     }
@@ -158,6 +209,15 @@ export function createGame(cfg, rng = Math.random, opts = {}) {
 
   /* ---------- взрывы ---------- */
   function goalDec(kind, c) { for (const g of S.goals) { if (g.kind === kind && (kind !== 'col' || g.c === c) && g.left > 0) { g.left--; return; } } }
+  /** Цель «шоколад»: left = сколько шоколада сейчас на поле (он может расти). */
+  function chocoCount() { let n = 0; for (const r of S.choco) for (const v of r) if (v) n++; return n; }
+  function syncChocoGoal() { const c = chocoCount(); for (const g of S.goals) if (g.kind === 'choco') g.left = c; }
+  function hitChoco(x, y, done) {
+    const k = y * W + x; if (done.has(k)) return; done.add(k);
+    S.choco[y][x] = 0; S.score += 60; chocoEaten = true;
+    hit({ kind: 'choco', x, y }); sound('choco');
+    syncChocoGoal();
+  }
   function hitCrate(x, y, done) {
     const k = y * W + x; if (done.has(k)) return; done.add(k);
     S.crate[y][x]--; S.score += 50;
@@ -165,7 +225,7 @@ export function createGame(cfg, rng = Math.random, opts = {}) {
     if (opened) { S.crate[y][x] = 0; goalDec('crate'); }
     hit({ kind: 'crate', x, y, opened });
   }
-  function mostCommonColor() { const cnt = Array(PALETTE_SIZE).fill(0); for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const t = S.tiles[y][x]; if (t && !t.sp && !t.lock) cnt[t.c]++; } let b = 0; cnt.forEach((v, i) => { if (v > cnt[b]) b = i; }); return b; }
+  function mostCommonColor() { const cnt = Array(PALETTE_SIZE).fill(0); for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const t = S.tiles[y][x]; if (t && !t.sp && !t.lock && !t.pac) cnt[t.c]++; } let b = 0; cnt.forEach((v, i) => { if (v > cnt[b]) b = i; }); return b; }
   function specialCells(sp, x, y, col) {
     const out = [];
     if (sp === 'h' || sp === 'cross') { for (let i = 0; i < W; i++) out.push([i, y]); fx({ type: 'h', i: y }); }
@@ -183,6 +243,8 @@ export function createGame(cfg, rng = Math.random, opts = {}) {
       const k = y * W + x; if (seen.has(k)) continue; seen.add(k);
       sx += x; sy += y; sn++;
       if (S.crate[y][x] > 0) { hitCrate(x, y, crateDone); continue; }
+      if (hasChoco && S.choco[y][x]) { hitChoco(x, y, crateDone); continue; }
+      if (S.tiles[y][x]?.pac) continue; // соску не взорвать
       if (S.ice[y][x] > 0) { S.ice[y][x]--; S.score += 40; hit({ kind: 'ice', x, y, left: S.ice[y][x] }); if (S.ice[y][x] === 0) goalDec('ice'); }
       const t = S.tiles[y][x]; if (!t) continue;
       adj.push([x, y]);
@@ -195,39 +257,94 @@ export function createGame(cfg, rng = Math.random, opts = {}) {
       S.score += 20 * mult;
       if (t.sp) { const sp = t.sp; t.sp = null; S.score += 60; sound('special'); queue.push(...specialCells(sp, x, y, undefined)); }
     }
-    for (const [x, y] of adj) for (const [dx, dy] of DIRS4) { const nx = x + dx, ny = y + dy; if (inb(nx, ny) && mask[ny][nx] && S.crate[ny][nx] > 0) hitCrate(nx, ny, crateDone); }
+    for (const [x, y] of adj) for (const [dx, dy] of DIRS4) { const nx = x + dx, ny = y + dy; if (inb(nx, ny) && mask[ny][nx] && S.crate[ny][nx] > 0) hitCrate(nx, ny, crateDone); else if (hasChoco && inb(nx, ny) && S.choco[ny][nx]) hitChoco(nx, ny, crateDone); }
     const gained = S.score - before;
     if (record && gained > 0 && sn) pending.popups.push({ text: '+' + gained, x: sx / sn, y: sy / sn });
   }
   function clearProtect() { for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const t = S.tiles[y][x]; if (t) t.protect = false; } }
 
   /* ---------- гравитация ---------- */
-  function canFall(x, y) { const t = S.tiles[y][x]; return mask[y][x] && t && !t.lock && !S.crate[y][x]; }
+  function canFall(x, y) { const t = S.tiles[y][x]; return mask[y][x] && t && !t.lock && !blk(x, y); }
+  /** Новая фишка сверху: обычно случайный цвет; на уровнях с сосками — соска, если пора. */
+  function spawnTile() {
+    const P = S.pac;
+    if (P && P.onBoard < P.max && P.spawned < P.total) { P.spawned++; P.onBoard++; return newPac(); }
+    return newTile(randColor());
+  }
   function settle() {
     const spawn = Array(W).fill(0); let moved = true, guard = 0;
     while (moved && guard++ < 400) {
       moved = false;
       for (let y = H - 1; y >= 0; y--) for (let x = 0; x < W; x++) {
-        if (!mask[y][x] || S.crate[y][x] || S.tiles[y][x]) continue;
-        let sy = y - 1; while (sy >= 0 && !mask[sy][x]) sy--;
-        if (sy < 0) { spawn[x]++; const t = newTile(randColor()); if (record) pending.spawn.push({ id: t.id, x, ry: y - spawn[x] }); S.tiles[y][x] = t; moved = true; continue; }
-        if (canFall(x, sy)) { S.tiles[y][x] = S.tiles[sy][x]; S.tiles[sy][x] = null; moved = true; continue; }
-        if (mask[sy][x] && !S.crate[sy][x] && !S.tiles[sy][x]) continue;
+        if (!mask[y][x] || blk(x, y) || S.tiles[y][x]) continue;
+        const pf = portals && portalTo.get(y * W + x);
+        if (pf) {
+          // выход телепорта: фишка приходит из клетки-входа
+          const [fx, fy] = pf;
+          if (canFall(fx, fy)) {
+            const t = S.tiles[fy][fx]; S.tiles[y][x] = t; S.tiles[fy][fx] = null; moved = true;
+            if (record) { pending.teleport.push({ id: t.id, from: [fx, fy], to: [x, y] }); if (!pending.sfx.some(s => s[0] === 'teleport')) sound('teleport'); }
+            continue;
+          }
+          if (mask[fy][fx] && !blk(fx, fy) && !S.tiles[fy][fx]) continue; // вход пока пуст — ждём
+        } else {
+          let sy = y - 1; while (sy >= 0 && !mask[sy][x]) sy--;
+          if (sy < 0) { spawn[x]++; const t = pacCfg ? spawnTile() : newTile(randColor()); if (record) pending.spawn.push({ id: t.id, x, ry: y - spawn[x] }); S.tiles[y][x] = t; moved = true; continue; }
+          const fromPortal = portals && portalFrom.has(sy * W + x); // из входа телепорта вниз не падают
+          if (!fromPortal && canFall(x, sy)) { S.tiles[y][x] = S.tiles[sy][x]; S.tiles[sy][x] = null; moved = true; continue; }
+          if (!fromPortal && mask[sy][x] && !blk(x, sy) && !S.tiles[sy][x]) continue;
+        }
         const dirs = rng() < 0.5 ? [-1, 1] : [1, -1];
         for (const dx of dirs) {
           const nx = x + dx, ny = y - 1; if (nx < 0 || nx >= W || ny < 0) continue; if (!canFall(nx, ny)) continue;
-          if (mask[y][nx] && !S.crate[y][nx] && !S.tiles[y][nx]) continue;
+          if (mask[y][nx] && !blk(nx, y) && !S.tiles[y][nx]) continue;
           S.tiles[y][x] = S.tiles[ny][nx]; S.tiles[ny][nx] = null; moved = true; break;
         }
       }
     }
   }
+  /** Падение; на уровнях с сосками — сбор сосок, дошедших до низа, и снова падение. */
+  function fall() {
+    settle();
+    emit('fall', { wait: true });
+    if (S.pac) while (collectPacifiers()) { emit('pacifier', { delay: 260 }); settle(); emit('fall', { wait: true }); }
+  }
+  function collectPacifiers() {
+    let any = false;
+    for (const k of exits) {
+      const x = k % W, y = Math.floor(k / W), t = S.tiles[y][x];
+      if (!t || !t.pac) continue;
+      S.tiles[y][x] = null; S.pac.onBoard--; S.pac.done++; S.score += 300; any = true;
+      if (record) { pending.removed.push({ id: t.id, x, y, c: -1, sp: null, pac: true }); pending.popups.push({ text: '+300', x, y }); }
+      hit({ kind: 'pacifier', x, y }); goalDec('pacifier'); sound('pacifier');
+    }
+    return any;
+  }
+  /** Шоколад разрастается: если за ход ни одна плитка не съедена — занимает соседнюю клетку с фишкой. */
+  function growChoco() {
+    if (!hasChoco || chocoEaten) return;
+    const cand = [];
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      if (!S.choco[y][x]) continue;
+      for (const [dx, dy] of DIRS4) {
+        const nx = x + dx, ny = y + dy;
+        if (!inb(nx, ny) || !mask[ny][nx] || blk(nx, ny)) continue;
+        const t = S.tiles[ny][nx]; if (!t || t.pac || t.lock || t.sp) continue;
+        cand.push([nx, ny]);
+      }
+    }
+    if (!cand.length) return;
+    const [x, y] = cand[Math.floor(rng() * cand.length)], t = S.tiles[y][x];
+    S.tiles[y][x] = null; S.choco[y][x] = 1; syncChocoGoal();
+    if (record) pending.removed.push({ id: t.id, x, y, c: t.c, sp: null });
+    hit({ kind: 'choco', x, y, grow: true }); sound('choco', 'grow');
+    emit('choco', { delay: 280 });
+  }
   /** Взрыв → пауза → падение (общий кусок для всех действий). */
   function blastAndFall(cells, delay) {
     blast(cells);
     emit('blast', { delay });
-    settle();
-    emit('fall', { wait: true });
+    fall();
   }
 
   /* ---------- ход ---------- */
@@ -256,8 +373,7 @@ export function createGame(cfg, rng = Math.random, opts = {}) {
       sound('pop', chain);
       if (chain >= 2) { const txt = COMBO_TXT[Math.min(chain, COMBO_TXT.length - 1)]; if (txt) banner(txt); }
       emit('blast', { chain, delay: 170 });
-      clearProtect(); settle();
-      emit('fall', { wait: true });
+      clearProtect(); fall();
       swapKeys = null;
     }
     S.chain = 1;
@@ -298,12 +414,21 @@ export function createGame(cfg, rng = Math.random, opts = {}) {
   }
   function ensureMoves(msg = TEXT.autoShuffle) {
     if (!findMove()) shuffleBoard(msg);
+    // Шоколад занял почти всё поле и ходов нет даже после перемешивания: Оля съедает шоколадку.
+    for (let i = 0; hasChoco && i < 6 && !findMove(); i++) {
+      const cells = []; for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (S.choco[y][x]) cells.push([x, y]);
+      if (!cells.length) break;
+      const [x, y] = cells[Math.floor(rng() * cells.length)];
+      S.choco[y][x] = 0; syncChocoGoal(); hit({ kind: 'choco', x, y }); banner(TEXT.olyaChoco);
+      emit('choco', { delay: 300 }); fall(); cascade(null);
+      if (!findMove()) shuffleBoard(msg);
+    }
   }
   function bonusTime() {
     if (S.moves > 0) { banner(TEXT.bonus); sound('woof'); emit('bonusStart', { delay: 800 }); }
     let guard = 0;
     while (S.moves > 0 && guard++ < 40) {
-      const cand = []; for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const t = S.tiles[y][x]; if (t && !t.sp && !t.lock) cand.push([x, y]); }
+      const cand = []; for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const t = S.tiles[y][x]; if (t && !t.sp && !t.lock && !t.pac) cand.push([x, y]); }
       if (!cand.length) break;
       const batch = Math.min(S.moves, 3), fire = [];
       for (let i = 0; i < batch && cand.length; i++) { const [x, y] = cand.splice(Math.floor(rng() * cand.length), 1)[0]; const t = S.tiles[y][x]; t.sp = rng() < 0.5 ? 'h' : 'v'; pop(t, 0.3); fire.push([x, y]); S.moves--; S.score += 100; }
@@ -319,7 +444,7 @@ export function createGame(cfg, rng = Math.random, opts = {}) {
   }
   function shuffleBoard(msg) {
     const pos = [], ts = [];
-    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (movable(x, y)) { pos.push([x, y]); ts.push(S.tiles[y][x]); }
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (movable(x, y) && !S.tiles[y][x].pac) { pos.push([x, y]); ts.push(S.tiles[y][x]); }
     for (let a = 0; a < 200; a++) {
       for (let i = ts.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); [ts[i], ts[j]] = [ts[j], ts[i]]; }
       if (a > 80) ts.forEach(t => { if (!t.sp) t.c = randColor(); });
@@ -335,13 +460,33 @@ export function createGame(cfg, rng = Math.random, opts = {}) {
   function begin() { steps = []; pending = freshPending(); }
   const result = (ok, extra) => ({ ok, steps, ...extra });
 
-  if (opts.board) loadBoard(opts.board);
+  if (opts.restore) restore(opts.restore);
+  else if (opts.board) loadBoard(opts.board);
   else {
-    fillBoard(); placeLocks();
+    fillBoard();
+    if (cfg.start) applyStart();
+    if (S.pac) placePacifiers();
+    placeLocks();
     // ИСПРАВЛЕНИЕ относительно старой версии: заморозка ставилась после проверки ходов
     // и иногда (≈1 из 50 стартов на уровнях с заморозкой) оставляла поле без ходов — игра «зависала».
     // Теперь в этом случае поле сразу тихо перемешивается. В остальных случаях rng тратится как раньше.
     if (!findMove()) { shuffleBoard(TEXT.autoShuffle); steps = []; pending = freshPending(); }
+  }
+  if (S.choco) syncChocoGoal();
+
+  /** Внутреннее состояние для clone(). */
+  function dump() {
+    return {
+      tiles: S.tiles.map(r => r.map(t => (t ? { ...t } : null))), ice: S.ice.map(r => r.slice()), crate: S.crate.map(r => r.slice()),
+      choco: S.choco && S.choco.map(r => r.slice()), pac: S.pac && { ...S.pac },
+      moves: S.moves, score: S.score, goals: S.goals.map(g => ({ ...g })), status: S.status, tileId,
+    };
+  }
+  function restore(d) {
+    S.tiles = d.tiles.map(r => r.map(t => (t ? { ...t } : null))); S.ice = d.ice.map(r => r.slice()); S.crate = d.crate.map(r => r.slice());
+    if (d.choco) S.choco = d.choco.map(r => r.slice());
+    if (d.pac) S.pac = { ...d.pac };
+    S.moves = d.moves; S.score = d.score; S.goals = d.goals.map(g => ({ ...g })); S.status = d.status; tileId = d.tileId;
   }
 
   const api = {
@@ -358,7 +503,8 @@ export function createGame(cfg, rng = Math.random, opts = {}) {
       if (!movable(ax, ay) || !movable(bx, by)) { sound('bad'); emit('bad'); return result(false, { reason: 'immovable' }); }
       const A = S.tiles[ay][ax], B = S.tiles[by][bx];
       swapCells(a, b); sound('swap'); emit('swap', { wait: true });
-      if (A.sp === 'c' || B.sp === 'c' || (A.sp && B.sp)) {
+      chocoEaten = false;
+      if (!A.pac && !B.pac && (A.sp === 'c' || B.sp === 'c' || (A.sp && B.sp))) {
         S.moves--; emit('hud'); comboSwap(A, [bx, by], B, [ax, ay]);
       } else if (findGroups().length) {
         S.moves--; emit('hud'); cascade([by * W + bx, ay * W + ax]);
@@ -366,6 +512,7 @@ export function createGame(cfg, rng = Math.random, opts = {}) {
         swapCells(a, b); sound('bad'); emit('swapBack', { wait: true });
         return result(false, { reason: 'noMatch' });
       }
+      if (!goalsDone()) growChoco();
       afterMove();
       return result(true);
     },
@@ -401,6 +548,8 @@ export function createGame(cfg, rng = Math.random, opts = {}) {
     /** Звёзды за текущий счёт (1..3), как в старой версии. */
     stars: () => (S.score >= cfg.t3 ? 3 : S.score >= cfg.t2 ? 2 : 1),
     snapshot,
+    /** Копия игры с другим rng (для бота: «примерить» ход). Шаги в копии не пишутся. */
+    clone: (rng2 = Math.random) => createGame(cfg, rng2, { events: false, restore: dump() }),
   };
   return api;
 }

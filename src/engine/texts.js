@@ -8,4 +8,5 @@ export const TEXT = {
   bonus: 'Бонус от Чапы и Пуши!',
   autoShuffle: 'Пуша перемешал шарики!',
   pushaShuffle: 'Пуша всё перемешал!',
+  olyaChoco: 'Оля съела шоколадку!',
 };
