@@ -83,12 +83,13 @@ export function legacyGame(n, rng) {
 /** Снимок состояния старой игры в нейтральном формате для сравнения. */
 export function legacySnapshot(api) {
   const G = api.G;
-  return {
+  // JSON — чтобы убрать прототипы из чужого vm-контекста (иначе deepStrictEqual не равен)
+  return JSON.parse(JSON.stringify({
     tiles: G.tiles.map(row => row.map(t => (t ? { c: t.c, sp: t.sp || null, lock: t.lock } : null))),
     ice: G.ice.map(r => r.slice()),
     crate: G.crate.map(r => r.slice()),
     score: G.score,
     moves: G.moves,
     goals: G.goals.map(g => g.left),
-  };
+  }));
 }
