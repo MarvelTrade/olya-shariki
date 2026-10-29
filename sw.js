@@ -1,7 +1,7 @@
 // Service worker «Олиных шариков»: офлайн-режим.
 // ВАЖНО: при любом изменении файлов игры увеличь CACHE_VERSION — иначе у Оли останется старая версия.
 // Список ASSETS проверяет тест tests/engine/pwa.test.mjs (все файлы src/, styles/, icons/ должны быть в нём).
-const CACHE_VERSION = 'v2.0.0';
+const CACHE_VERSION = 'v2.0.1';
 const APP_CACHE = 'olya-app-' + CACHE_VERSION;
 const FONT_CACHE = 'olya-fonts-v1';
 
@@ -27,6 +27,7 @@ const ASSETS = [
   './src/render/board-view.js',
   './src/render/draw.js',
   './src/render/palette.js',
+  './src/render/obstacles-extra.js',
   './src/ui/app.js',
   './src/ui/game-screen.js',
   './src/ui/hud.js',
